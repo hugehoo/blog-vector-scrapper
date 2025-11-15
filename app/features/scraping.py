@@ -165,7 +165,7 @@ async def scrape_and_embed_post(
                 "url": url,
             }
 
-        # Step 2: Chunk content and generate embeddings
+        # Step 2: Clean and chunk content, then generate embeddings
         markdown_content = scraped_data.get("markdown", "")
         if not markdown_content:
             return {
@@ -174,7 +174,16 @@ async def scrape_and_embed_post(
                 "document_id": document_id,
             }
 
-        chunks = split_markdown_into_chunks(markdown_content)
+        # Clean text: remove code blocks, HTML tags, and extra whitespace
+        cleaned_content = clean_text(markdown_content)
+        if not cleaned_content:
+            return {
+                "success": False,
+                "message": "No content after cleaning",
+                "document_id": document_id,
+            }
+
+        chunks = split_markdown_into_chunks(cleaned_content)
         if not chunks:
             return {
                 "success": False,
@@ -277,6 +286,25 @@ async def extract_main_content_with_crawl4ai(url: str) -> dict:
             "markdown": "",
             "content_length": 0,
         }
+
+
+def clean_text(text: str) -> str:
+    """
+    Clean and normalize text by removing code blocks, HTML tags, and extra whitespace.
+
+    Args:
+        text: Raw text to clean
+
+    Returns:
+        Cleaned text
+    """
+    # 코드 블록 제거
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    # HTML 태그 제거
+    text = re.sub(r"<.*?>", "", text)
+    # 불필요한 공백 제거
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def split_markdown_into_chunks(
