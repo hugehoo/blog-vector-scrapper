@@ -16,7 +16,7 @@ class Settings:
 
     # Hugging Face Embedding settings
     HF_EMBEDDING_MODEL: str = os.getenv(
-        "HF_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        "HF_EMBEDDING_MODEL", "BAAI/bge-m3"
     )
     HF_EMBEDDING_DEVICE: str = os.getenv("HF_EMBEDDING_DEVICE", "cpu")
     HF_EMBEDDING_NORMALIZE: bool = os.getenv("HF_EMBEDDING_NORMALIZE", "true").lower() not in {
