@@ -115,12 +115,100 @@ async def scrape_batch(
     }
 
 
+async def process_single_post(post: dict) -> dict:
+    """
+    Process a single post: scrape, clean, embed, and store.
+
+    Args:
+        post: MongoDB post document
+
+    Returns:
+        Result dictionary with success status and details
+    """
+    document_id = str(post.get("_id"))
+    url = post.get("url")
+    start_time = time.time()
+
+    if not url:
+        return {
+            "success": False,
+            "document_id": document_id,
+            "error": "Post has no URL",
+        }
+
+    try:
+        # Step 1: Scrape content
+        scraped_data = await extract_main_content_with_crawl4ai(url)
+
+        if not scraped_data.get("success", False):
+            return {
+                "success": False,
+                "document_id": document_id,
+                "url": url,
+                "error": f"Scraping failed: {scraped_data.get('error', 'Unknown error')}",
+            }
+
+        # Step 2: Clean and chunk content
+        markdown_content = scraped_data.get("markdown", "")
+        if not markdown_content:
+            return {
+                "success": False,
+                "document_id": document_id,
+                "url": url,
+                "error": "No content to embed",
+            }
+
+        cleaned_content = clean_text(markdown_content)
+        if not cleaned_content:
+            return {
+                "success": False,
+                "document_id": document_id,
+                "url": url,
+                "error": "No content after cleaning",
+            }
+
+        chunks = split_markdown_into_chunks(cleaned_content)
+        if not chunks:
+            return {
+                "success": False,
+                "document_id": document_id,
+                "url": url,
+                "error": "Failed to produce chunks",
+            }
+
+        # Step 3: Generate embeddings
+        embedding_service = get_embedding_service()
+        embedding_vectors = embedding_service.generate_embeddings(chunks)
+
+        # Step 4: Store in Milvus
+        milvus_client = get_milvus_client()
+        milvus_client.insert_document_chunks(document_id, embedding_vectors)
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "url": url,
+            "title": post.get("title"),
+            "chunks_indexed": len(embedding_vectors),
+            "elapsed_time_seconds": round(time.time() - start_time, 2),
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "document_id": document_id,
+            "url": url,
+            "error": str(e),
+            "elapsed_time_seconds": round(time.time() - start_time, 2),
+        }
+
+
 @router.post("/scrape-and-embed")
 async def scrape_and_embed_post(
     skip: int = Query(0, ge=0, description="Index of the post to process"),
 ):
     """
-    Scrape a blog post, generate embedding, and store in Milvus.
+    Scrape a single blog post, generate embedding, and store in Milvus.
 
     Steps:
     1. Fetch post from MongoDB
@@ -129,7 +217,6 @@ async def scrape_and_embed_post(
     4. Store embedding in Milvus
     """
     collection = get_blog_posts_collection()
-    start_time = time.time()
 
     # Get one post from MongoDB
     cursor = collection.find({}).skip(skip).limit(1)
@@ -142,86 +229,105 @@ async def scrape_and_embed_post(
             "skip": skip,
         }
 
-    post = posts[0]
-    document_id = str(post.get("_id"))
-    url = post.get("url")
+    # Process the single post
+    result = await process_single_post(posts[0])
 
-    if not url:
-        return {
-            "success": False,
-            "message": "Post has no URL",
-            "document_id": document_id,
-        }
-
-    try:
-        # Step 1: Scrape content
-        scraped_data = await extract_main_content_with_crawl4ai(url)
-
-        if not scraped_data.get("success", False):
-            return {
-                "success": False,
-                "message": f"Scraping failed: {scraped_data.get('error', 'Unknown error')}",
-                "document_id": document_id,
-                "url": url,
-            }
-
-        # Step 2: Clean and chunk content, then generate embeddings
-        markdown_content = scraped_data.get("markdown", "")
-        if not markdown_content:
-            return {
-                "success": False,
-                "message": "No content to embed",
-                "document_id": document_id,
-            }
-
-        # Clean text: remove code blocks, HTML tags, and extra whitespace
-        cleaned_content = clean_text(markdown_content)
-        if not cleaned_content:
-            return {
-                "success": False,
-                "message": "No content after cleaning",
-                "document_id": document_id,
-            }
-
-        chunks = split_markdown_into_chunks(cleaned_content)
-        if not chunks:
-            return {
-                "success": False,
-                "message": "Failed to produce paragraph chunks",
-                "document_id": document_id,
-            }
-
+    # Add embedding dimension info if successful
+    if result["success"]:
         embedding_service = get_embedding_service()
-        embedding_vectors = embedding_service.generate_embeddings(chunks)
+        result["embedding_dimension"] = embedding_service.get_dimension()
+        result["message"] = "Post scraped, embedded, and stored successfully"
 
-        # Step 3: Store in Milvus
-        milvus_client = get_milvus_client()
-        milvus_client.insert_document_chunks(document_id, embedding_vectors)
+    return result
 
-        elapsed_time = time.time() - start_time
 
-        return {
-            "success": True,
-            "message": "Post scraped, embedded, and stored successfully",
-            "document_id": document_id,
-            "url": url,
-            "original_title": post.get("title"),
-            "content_length": scraped_data.get("full_content_length", 0),
-            "embedding_dimension": embedding_service.get_dimension(),
-            "chunks_indexed": len(embedding_vectors),
-            "elapsed_time_seconds": round(elapsed_time, 2),
-        }
+@router.post("/scrape-and-embed-bulk")
+async def scrape_and_embed_bulk(
+    skip: int = Query(0, ge=0, description="Starting index"),
+    limit: int = Query(100, ge=1, le=500, description="Number of posts to process"),
+    batch_size: int = Query(10, ge=1, le=50, description="Concurrent processing batch size"),
+):
+    """
+    Bulk scrape, embed, and store multiple blog posts in Milvus.
 
-    except Exception as e:
-        elapsed_time = time.time() - start_time
+    Process posts in semi-batches for optimal performance:
+    - Fetches multiple posts from MongoDB
+    - Processes them in batches (concurrent processing)
+    - Continues even if some posts fail
+
+    Args:
+        skip: Starting index in MongoDB
+        limit: Total number of posts to process (max 500)
+        batch_size: Number of posts to process concurrently (default 10)
+
+    Returns:
+        Summary with success/failure counts and failed post details
+    """
+    collection = get_blog_posts_collection()
+    overall_start_time = time.time()
+
+    # Fetch posts from MongoDB
+    cursor = collection.find({}).skip(skip).limit(limit)
+    posts = await cursor.to_list(length=limit)
+
+    if not posts:
         return {
             "success": False,
-            "message": f"Processing failed: {str(e)}",
-            "document_id": document_id,
-            "url": url,
-            "error": str(e),
-            "elapsed_time_seconds": round(elapsed_time, 2),
+            "message": "No posts found",
+            "skip": skip,
+            "limit": limit,
         }
+
+    total_posts = len(posts)
+    successful_results = []
+    failed_results = []
+
+    # Process posts in batches
+    for i in range(0, total_posts, batch_size):
+        batch = posts[i : i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (total_posts + batch_size - 1) // batch_size
+
+        print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} posts)...")
+
+        # Process batch concurrently
+        results = await asyncio.gather(
+            *[process_single_post(post) for post in batch],
+            return_exceptions=True,  # Continue even if some fail
+        )
+
+        # Categorize results
+        for result in results:
+            if isinstance(result, Exception):
+                failed_results.append({"error": str(result)})
+            elif isinstance(result, dict) and result.get("success"):
+                successful_results.append(result)
+            elif isinstance(result, dict):
+                failed_results.append(result)
+            else:
+                failed_results.append({"error": f"Unexpected result type: {type(result)}"})
+
+    elapsed_time = time.time() - overall_start_time
+
+    return {
+        "success": True,
+        "message": f"Bulk processing completed",
+        "skip": skip,
+        "limit": limit,
+        "batch_size": batch_size,
+        "total_requested": limit,
+        "total_found": total_posts,
+        "processed": len(successful_results) + len(failed_results),
+        "successful": len(successful_results),
+        "failed": len(failed_results),
+        "success_rate": round(len(successful_results) / total_posts * 100, 2)
+        if total_posts > 0
+        else 0,
+        "failed_posts": failed_results[:20],  # Limit to first 20 failures
+        "total_chunks_indexed": sum(r.get("chunks_indexed", 0) for r in successful_results),
+        "elapsed_time_seconds": round(elapsed_time, 2),
+        "avg_time_per_post": round(elapsed_time / total_posts, 2) if total_posts > 0 else 0,
+    }
 
 
 # Helper functions
